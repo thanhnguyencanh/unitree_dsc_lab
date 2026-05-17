@@ -234,9 +234,29 @@ class RewardsCfg:
         },
     )
 
-    # NOTE: paper-specific shaping terms (swing_clearance_bonus,
-    # step_alignment_bonus) live in `mdp/rewards.py` as stubs — drop them in
-    # here once implemented.
+    # Paper §III-C stair-specific shaping (stateful ManagerTermBase classes).
+    swing_clearance = RewTerm(
+        func=mdp.swing_clearance_bonus,
+        weight=2.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=".*_ankle_roll_link"
+            ),
+            "clearance_margin": 0.05,
+        },
+    )
+    step_alignment = RewTerm(
+        func=mdp.step_alignment_bonus,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=".*_ankle_roll_link"
+            ),
+            "window_margin": 0.04,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

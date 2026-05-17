@@ -43,6 +43,8 @@ A living view of where this replication stands. Tick items off as you finish the
 - [x] **§8 follow-up — Stair scene + reset event wired.** `StairTerrainGenerator(TerrainGenerator)` subclass records per-`(row, col)` GT in `StairGTRegistry._by_row_col` at terrain build. `StairTerrainGeneratorCfg` (with `class_type=StairTerrainGenerator`) is used by `STAIR_TERRAIN_CFG` in [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py), mixing the three class-locked presets `FlatLeadInCfg`/`StairsUpCfg`/`StairsDownCfg` via `proportion=(0.2, 0.4, 0.4)` across `num_rows=10 × num_cols=20`. Reset-mode event `mdp.reset_privileged_teacher` (a `ManagerTermBase`) attaches `env.privileged_teacher` on first call and on every reset calls `teacher.refresh_from_terrain(env_ids, env.scene.terrain)`. Smoke-tested: every tile has a registry entry, per-row class distribution matches proportions, h_step escalates with curriculum, teacher GT matches the assigned `(row, col)` per env.
 - [x] **§9 — `points_to_bev` implemented.** Pure-tensor (CPU/GPU) projection from `(N, 3)` or `(B, N, 3)` point clouds in robot frame to a `(6, 60, 60)` / `(B, 6, 60, 60)` BEV. Single set of `scatter_add_` / `scatter_reduce_` calls on flattened cell indices — no Python loop over envs. Supports custom `x_range` / `y_range` / `resolution` and an optional `valid_mask` for padded ragged clouds. Channels: `[max, min, mean, max - min, std, density]`; density is per-batch-normalized; empty cells zero-filled. Smoke-tested: cell math on single + multi-point clouds, OOR drop, empty cloud, batched-vs-unbatched parity, density normalization.
 - [x] **§9 — `BEVStudentEncoder` implemented.** Conv trunk `Conv(6→32) → Conv(32→64) → Conv(64→128)` (all `k=3, s=2, p=1`, BN + ReLU) takes a `(B, 6, 60, 60)` BEV down to `F_enc ∈ R^{B×128×8×8}`; shared MLP `Linear(8192→256→128)` then four heads emit `(class_logits[3], h_step, d_step, theta_yaw)`. Returns a `BEVPrediction` dataclass exposing `feat=F_enc` for joint training. `predict_token(bev) → (B, 4)` matches `PrivilegedTeacher.token()`'s layout so swapping student for teacher in `ObservationsCfg.PolicyCfg` is a one-line change. `terrain_loss(pred, target)` implements Eq. 8 (`0.6·CE + 1.0·L1(h) + 1.0·L1(d)`); yaw head is excluded by design. ≈2.2 M params. Smoke-tested: forward shapes, F_enc shape, `predict_token` shape + class range, loss finite, gradient isolation for the yaw head, gradients reach class/h/d heads + conv trunk, end-to-end with a real `points_to_bev` output.
+- [x] **§11 — `swing_clearance_bonus` + `step_alignment_bonus` implemented.** Both are stateful `ManagerTermBase` classes in [`tasks/stair_climb/mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py) and read per-env GT from `env.privileged_teacher`. `swing_clearance_bonus` tracks `lift_off_z` per foot from in-contact frames and emits a dense per-step bonus `sum_feet(clamp(foot_z − lift_off_z − (h_step + clearance_margin), 0))` while the foot is airborne — gated to `class_id == 1` (stairs-up). `step_alignment_bonus` tracks each foot's last touchdown xy in the world frame and, on every first-contact event (`ContactSensor.compute_first_contact(step_dt)`), measures forward distance from the previous touchdown projected onto the stair-forward axis `[cos(θ_yaw_terrain), sin(θ_yaw_terrain)]` and rewards a Gaussian `exp(−err² / window_margin²)` with `err = projected_delta − d_step` — gated to `class_id ∈ {1, 2}`. Both implement `reset(env_ids)` to clear per-env state on episode reset. Wired into `RewardsCfg` (`swing_clearance` weight 2.0, `step_alignment` weight 1.0) keyed on `.*_ankle_roll_link`. Smoke-tested: shape + first-call seeding, class masking (flat zero / stairs-up active / stairs-down behavior), reset clears per-env state, Gaussian peak at exact `d_step`, `e^−1` at one-window-margin offset, terrain-yaw rotation aligns the axis to `+Y`, no-reward path when `compute_first_contact` is False, graceful zero when `env.privileged_teacher` is absent.
+- [x] **§11 — `StairClimbActorCritic` wired for rsl-rl OnPolicyRunner.** Thin `rsl_rl.models.MLPModel` subclass in [`tasks/stair_climb/policy/actor_critic.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/policy/actor_critic.py) used for **both** the actor (Gaussian distribution, `output_dim=num_actions`) and the critic (deterministic, `output_dim=1`) — the paper's policy is a memoryless MLP over `o_prop ⊕ z_t` (Eq. 1) and rsl-rl's new (>= 4.0.0) construction path already splits actor/critic, so no custom architecture is needed. Class attributes `paper_terrain_token_dim = 4` and `is_recurrent = False` document the contract. [`agents/rsl_rl_ppo_cfg.py::BasePPORunnerCfg`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/agents/rsl_rl_ppo_cfg.py) was modernized to the new `RslRlMLPModelCfg` actor/critic API: both reference the qualified name `"unitree_dsc_lab.tasks.stair_climb.policy.actor_critic:StairClimbActorCritic"` (resolved by `rsl_rl.utils.resolve_callable`), `obs_groups = {"actor": ["policy"], "critic": ["critic"]}` matches the env, paper-aligned hidden dims `[512, 256, 128]` + `elu` carry over. Smoke-tested against the live `rsl_rl` install: stochastic actor forward shape `(B, num_actions)`, log-prob, entropy/std, `update_normalization` no-op; deterministic critic returns reproducible `(B, 1)`; `EmpiricalNormalization` activates when `obs_normalization=True`; qualified-name string parses to the expected class.
 
 ### To-Do — environment
 
@@ -62,9 +64,7 @@ A living view of where this replication stands. Tick items off as you finish the
 
 ### To-Do — simulation & training code
 
-- [x] **§11** — `G1StairClimbEnvCfg` scaffolded (scene with `StairTerrainGeneratorCfg`, proprio + `terrain_token_privileged` obs, joint-pos actions, forward-velocity command, IsaacLab-default rough-locomotion reward stack, reset/startup/interval events incl. `reset_privileged_teacher`, terminations, `terrain_levels_vel` curriculum). Stair-specific shaping (`swing_clearance_bonus`/`step_alignment_bonus`) is still pending.
-- [ ] **§11** — Implement `swing_clearance_bonus` and `step_alignment_bonus` rewards.
-- [ ] **§11** — Implement `StairClimbActorCritic` compatible with rsl_rl `OnPolicyRunner`.
+- [x] **§11** — `G1StairClimbEnvCfg` scaffolded (scene with `StairTerrainGeneratorCfg`, proprio + `terrain_token_privileged` obs, joint-pos actions, forward-velocity command, IsaacLab-default rough-locomotion reward stack + stair-specific shaping (`swing_clearance_bonus`/`step_alignment_bonus`), reset/startup/interval events incl. `reset_privileged_teacher`, terminations, `terrain_levels_vel` curriculum).
 - [ ] **§12** — Implement `ThreeStagePPORunner` (stage-1 PPO loop, stage-2 perception SL, stage-3 joint loss).
 - [ ] **§12** — Stage 1 reaches `success_rate > 0.85` on training stair heights.
 - [ ] **§12** — Stage 2 hits `MAE(h) < 1 cm`, `MAE(d) < 1 cm`, `class_acc > 99 %`.
@@ -243,7 +243,9 @@ unitree_dsc_lab/
 │       ├── utils/{parser_cfg,export_deploy_cfg}.py
 │       └── tasks/stair_climb/
 │           ├── agents/rsl_rl_ppo_cfg.py     # PPO runner cfg
-│           ├── mdp/                         # observations, rewards, terminations, commands
+│           ├── mdp/                         # observations, rewards, terminations, commands,
+│           │                                #   curriculums (terrain_levels_vel),
+│           │                                #   events (reset_privileged_teacher)
 │           ├── robots/g1_23dof/             # env cfg + gym.register("Unitree-G1-23dof-StairClimb-v0")
 │           ├── terrains/stair_generator.py  # procedural staircase
 │           ├── perception/{bev,encoder,teacher}.py
@@ -466,7 +468,7 @@ L_terrain = 0.6 * F.cross_entropy(logits_s, s_gt) \
 
 ## 11. PPO Policy: Observations, Actions, Rewards
 
-**Status: env cfg scaffolded** — [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py::G1StairClimbEnvCfg`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py) wires the scene (`StairTerrainGeneratorCfg` + G1 articulation + contact sensor), observations (policy + critic groups), actions, commands, rewards, events (incl. `reset_privileged_teacher`), terminations, and `terrain_levels_vel` curriculum. The two paper-specific shaping rewards remain as stubs in [`mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py).
+**Status: env cfg scaffolded incl. stair-shaping rewards** — [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py::G1StairClimbEnvCfg`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py) wires the scene (`StairTerrainGeneratorCfg` + G1 articulation + contact sensor), observations (policy + critic groups), actions, commands, rewards (rough-locomotion stack + `swing_clearance_bonus` + `step_alignment_bonus`), events (incl. `reset_privileged_teacher`), terminations, and `terrain_levels_vel` curriculum.
 
 **Observation** (per Eq. 1):
 ```
@@ -481,11 +483,33 @@ o_t    = concat(o_prop, z_t)                              # z_t = mdp.terrain_to
 
 **Commands:** `mdp.UniformVelocityCommandCfg` with forward-only ranges `lin_vel_x ∈ [0.0, 0.7] m/s`, small ang_vel_z noise; resampling every 8–12 s.
 
-**Rewards:** IsaacLab's default rough-locomotion stack (`track_lin_vel_xy_exp`, `track_ang_vel_z_exp`, `is_alive`, `lin_vel_z_l2`, `ang_vel_xy_l2`, `flat_orientation_l2`, `base_height_l2`, `joint_vel_l2`, `joint_acc_l2`, `action_rate_l2`, `joint_pos_limits`, arm/waist `joint_deviation_l1`, `undesired_contacts`). Plus two paper-specific shaping terms still to implement (stubs in [`mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py)):
-- `swing_clearance_bonus` — reward foot apex height ≥ `h_step + 5 cm` during stair-up
-- `step_alignment_bonus`  — reward landing inside `d_step` window after stair edge
+**Rewards:** IsaacLab's default rough-locomotion stack (`track_lin_vel_xy_exp`, `track_ang_vel_z_exp`, `is_alive`, `lin_vel_z_l2`, `ang_vel_xy_l2`, `flat_orientation_l2`, `base_height_l2`, `joint_vel_l2`, `joint_acc_l2`, `action_rate_l2`, `joint_pos_limits`, arm/waist `joint_deviation_l1`, `undesired_contacts`), plus two stateful paper-specific shaping terms ([`mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py)) — both `ManagerTermBase` classes that key on `.*_ankle_roll_link` and read per-env GT from `env.privileged_teacher`:
 
-Once those land, register them in `RewardsCfg` alongside the existing terms.
+- `swing_clearance_bonus` (weight 2.0) — tracks `lift_off_z` per foot from in-contact frames; while a foot is airborne, emits dense `sum_feet(clamp(foot_z − lift_off_z − (h_step + clearance_margin), 0))`. Gated to `class_id == 1` (stairs-up); `clearance_margin = 0.05`.
+- `step_alignment_bonus` (weight 1.0) — tracks each foot's last touchdown xy in world frame; on every first-contact event (`ContactSensor.compute_first_contact(step_dt)`) measures forward distance projected onto the stair-forward axis `[cos(θ_yaw_terrain), sin(θ_yaw_terrain)]` and rewards a Gaussian `exp(−(projected_delta − d_step)² / window_margin²)`. Gated to `class_id ∈ {1, 2}` (stairs); `window_margin = 0.04`. First touchdown after reset is used only to seed state.
+
+Both implement `reset(env_ids)` to clear per-env buffers on episode reset, so the next stride re-seeds cleanly.
+
+**Actor-critic:** [`tasks/stair_climb/policy/actor_critic.py::StairClimbActorCritic`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/policy/actor_critic.py) is a thin `rsl_rl.models.MLPModel` subclass used for both the actor (Gaussian distribution, output_dim = num_actions) and the critic (deterministic, output_dim = 1) — paper §III-A specifies a memoryless MLP over `o_prop ⊕ z_t`, which is exactly what `MLPModel` provides. The class exposes paper-aligned defaults (`hidden_dims=(512, 256, 128)`, `activation="elu"`) plus class attributes `paper_terrain_token_dim = 4` / `is_recurrent = False`. rsl-rl ≥ 4.0.0's `OnPolicyRunner` resolves the class via the qualified-name string in the runner cfg.
+
+**rsl-rl PPO runner cfg:** [`agents/rsl_rl_ppo_cfg.py::BasePPORunnerCfg`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/agents/rsl_rl_ppo_cfg.py) uses the new split-model API:
+
+```python
+obs_groups = {"actor": ["policy"], "critic": ["critic"]}
+
+actor = RslRlMLPModelCfg(
+    class_name="unitree_dsc_lab.tasks.stair_climb.policy.actor_critic:StairClimbActorCritic",
+    hidden_dims=[512, 256, 128], activation="elu", obs_normalization=True,
+    distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0),
+)
+critic = RslRlMLPModelCfg(
+    class_name="unitree_dsc_lab.tasks.stair_climb.policy.actor_critic:StairClimbActorCritic",
+    hidden_dims=[512, 256, 128], activation="elu", obs_normalization=True,
+    distribution_cfg=None,
+)
+```
+
+PPO hyperparameters follow paper §III-D + Table II (lr 3e-4, γ 0.99, λ 0.95, clip 0.2, KL 0.01, entropy 0.005, 5 epochs × 4 mini-batches).
 
 ---
 
@@ -636,7 +660,8 @@ ros2 topic pub /cmd_vel geometry_msgs/Twist "{linear: {x: 0.3}}"
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| Robot scuffs on step edge | swing clearance reward too low or `h_step` underestimated | Increase `swing_clearance_bonus`; check encoder MAE on real depth |
+| Robot scuffs on step edge | swing clearance reward too low or `h_step` underestimated | Increase `swing_clearance_bonus` weight or `clearance_margin`; check encoder MAE on real depth |
+| Foot lands short / long of stair tread | `d_step` underestimated by encoder or step_alignment too weak | Increase `step_alignment_bonus` weight; widen `window_margin` if learning curve is flat early |
 | Yaws away from stair | `theta_yaw` channel noisy | Add IMU yaw filter; widen domain rand on yaw init |
 | Works in sim, falls in real | PD gain mismatch | Match `Kp/Kd` to `unitree_sdk2` defaults; verify joint order |
 | Encoder predicts `h=0` on real stairs | BEV empty / depth out of range | Check depth min/max clip, extrinsic calibration, BEV frame |
@@ -661,4 +686,4 @@ ros2 topic pub /cmd_vel geometry_msgs/Twist "{linear: {x: 0.3}}"
 
 ---
 
-*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded); §9 `points_to_bev` + `BEVStudentEncoder` + `terrain_loss` implemented (≈ 2.2 M params, `predict_token` matches teacher layout, yaw head isolated from `terrain_loss`, smoke-tested end-to-end with real BEVs); §11 prose refreshed. Remaining gaps: `swing_clearance_bonus` / `step_alignment_bonus` rewards, `foot_contact_flags` obs, `StairClimbActorCritic`, three-stage runner. Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
+*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded); §9 `points_to_bev` + `BEVStudentEncoder` + `terrain_loss` implemented (≈ 2.2 M params, `predict_token` matches teacher layout, yaw head isolated from `terrain_loss`, smoke-tested end-to-end with real BEVs); §11 stair-shaping rewards `swing_clearance_bonus` + `step_alignment_bonus` implemented as `ManagerTermBase` classes (per-foot state, class-id gated) and wired into `RewardsCfg`; §11 `StairClimbActorCritic` implemented as a thin `rsl_rl.models.MLPModel` subclass and referenced via qualified-name from a modernized `BasePPORunnerCfg` (new actor/critic API, paper-aligned hidden dims + PPO hyperparams), smoke-tested against the live `rsl_rl` install for both actor (Gaussian) and critic (deterministic) roles. Remaining gaps: `foot_contact_flags` obs, three-stage runner (`ThreeStagePPORunner`). Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
