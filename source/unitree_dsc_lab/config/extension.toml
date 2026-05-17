@@ -1,0 +1,18 @@
+[package]
+version = "0.1.0"
+title = "Unitree DSC Lab"
+description = "Stair-climbing replication for Unitree G1 with explicit terrain conditioning"
+author = "DSC Labs"
+maintainer = "DSC Labs"
+repository = "https://github.com/dsc-labs/unitree_dsc_lab"
+keywords = ["robotics", "humanoid", "g1", "stair-climbing", "isaac-lab", "reinforcement-learning"]
+category = "robotics"
+readme = "README.md"
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_tasks" = {}
+
+[[python.module]]
+name = "unitree_dsc_lab"

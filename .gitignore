@@ -1,0 +1,77 @@
+# C++
+**/cmake-build*/
+**/build*/
+**/*.so
+**/*.log*
+
+# Omniverse
+**/*.dmp
+**/.thumbs
+
+# No USD files allowed in the repo
+**/*.usd
+**/*.usda
+**/*.usdc
+**/*.usdz
+
+# Python
+.DS_Store
+**/*.egg-info/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+**/*.pb
+
+# Docker
+**/*.sif
+docker/cluster/exports/
+docker/.container.cfg
+
+# IDE
+**/.idea/
+**/.vscode/
+!.vscode
+
+# Outputs
+**/output/*
+**/outputs/*
+**/videos/*
+**/wandb/*
+**/.neptune/*
+docker/artifacts/
+*.tmp
+
+# Doc Outputs
+**/docs/_build/*
+**/generated/*
+
+# Isaac-Sim packman
+_isaac_sim*
+_repo
+_build
+.lastformat
+
+# RL-Games
+**/runs/*
+**/logs/*
+**/recordings/*
+
+# Pre-Trained Checkpoints
+/.pretrained_checkpoints/
+
+# Datasets
+datasets/
+*.npz
+*.bag
+
+# Deploy / model artefacts
+*.pt
+*.onnx
+*.obj
+*.mtl
+*.STL
+**/env.yaml
+
+# Assets — robot descriptions fetched externally
+assets/g1/unitree_ros/
+assets/g1/unitree_model/
