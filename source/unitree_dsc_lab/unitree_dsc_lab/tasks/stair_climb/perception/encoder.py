@@ -116,13 +116,14 @@ def terrain_loss(
     lambda_cls: float = 0.6,
     lambda_h: float = 1.0,
     lambda_d: float = 1.0,
+    lambda_yaw: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Paper Eq. 8 — terrain perception loss.
+    """Paper Eq. 8 + yaw supervision — terrain perception loss.
 
-    ``L_terrain = lambda_cls * CE(logits, class) + lambda_h * L1(h) + lambda_d * L1(d)``.
+    ``L_terrain = λ_cls*CE(class) + λ_h*SmoothL1(h) + λ_d*SmoothL1(d) + λ_yaw*SmoothL1(yaw)``.
 
-    Yaw is **not** included (paper §III-A.3 — yaw is supplied to the policy from
-    proprioception, so the yaw head is trained only as a sanity check).
+    Paper Eq. (8) lists only cls/h/d, but Table II reports MAE(θ_yaw)=1.8° in sim,
+    which requires explicit yaw supervision.  λ_yaw=1.0 matches the h/d weights.
 
     Args:
         pred: Encoder forward output.
@@ -130,8 +131,7 @@ def terrain_loss(
             as :meth:`PrivilegedTeacher.token`.
 
     Returns:
-        Dict with ``"total"``, ``"cls"``, ``"h"``, ``"d"`` losses (all scalars).
-        Each component is averaged over the batch.
+        Dict with ``"total"``, ``"cls"``, ``"h"``, ``"d"``, ``"yaw"`` losses.
     """
     if target.shape[-1] != 4:
         raise ValueError(f"target must be (B, 4); got {tuple(target.shape)}")
@@ -139,13 +139,15 @@ def terrain_loss(
     class_gt = target[..., 0].to(torch.long)
     h_gt = target[..., 1]
     d_gt = target[..., 2]
+    yaw_gt = target[..., 3]
 
     loss_cls = F.cross_entropy(pred.logits_class, class_gt)
     loss_h = F.smooth_l1_loss(pred.h_step, h_gt)
     loss_d = F.smooth_l1_loss(pred.d_step, d_gt)
+    loss_yaw = F.smooth_l1_loss(pred.theta_yaw, yaw_gt)
 
-    total = lambda_cls * loss_cls + lambda_h * loss_h + lambda_d * loss_d
-    return {"total": total, "cls": loss_cls, "h": loss_h, "d": loss_d}
+    total = lambda_cls * loss_cls + lambda_h * loss_h + lambda_d * loss_d + lambda_yaw * loss_yaw
+    return {"total": total, "cls": loss_cls, "h": loss_h, "d": loss_d, "yaw": loss_yaw}
 
 
 __all__ = ["BEVPrediction", "BEVStudentEncoder", "terrain_loss"]

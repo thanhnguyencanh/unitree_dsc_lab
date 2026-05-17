@@ -134,7 +134,7 @@ class ThreeStagePPORunner(OnPolicyRunner):
             print(
                 f"[Stage 2] epoch {epoch + 1:03d}/{num_epochs}  "
                 f"total={losses['total']:.4f}  cls={losses['cls']:.4f}  "
-                f"h={losses['h']:.4f}  d={losses['d']:.4f}"
+                f"h={losses['h']:.4f}  d={losses['d']:.4f}  yaw={losses['yaw']:.4f}"
             )
 
         # Unfreeze PPO actor + critic
@@ -240,6 +240,7 @@ class ThreeStagePPORunner(OnPolicyRunner):
                 loss_dict["terrain_cls"] = perc["cls"]
                 loss_dict["terrain_h"] = perc["h"]
                 loss_dict["terrain_d"] = perc["d"]
+                loss_dict["terrain_yaw"] = perc["yaw"]
 
             learn_time = time.time() - t_start
             self.current_learning_iteration = it
@@ -369,7 +370,7 @@ class ThreeStagePPORunner(OnPolicyRunner):
         from unitree_dsc_lab.tasks.stair_climb.perception.encoder import terrain_loss
 
         N = bev.shape[0]
-        totals = {"total": 0.0, "cls": 0.0, "h": 0.0, "d": 0.0}
+        totals = {"total": 0.0, "cls": 0.0, "h": 0.0, "d": 0.0, "yaw": 0.0}
         n_updates = 0
 
         self.encoder.train()

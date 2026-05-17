@@ -1,15 +1,8 @@
-"""Episode termination terms for the stair-climbing task."""
+"""Episode termination terms for the stair-climbing task.
 
-from __future__ import annotations
+All terminations used by G1StairClimbEnvCfg come from isaaclab.envs.mdp
+(time_out, root_height_below_minimum, bad_orientation) via the star-import
+in mdp/__init__.py.  No custom terms are required.
+"""
 
-from typing import TYPE_CHECKING
-
-import torch
-
-if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
-
-
-def fell_over(env: "ManagerBasedRLEnv", roll_pitch_threshold: float = 0.7) -> torch.Tensor:
-    """Terminate when |roll| or |pitch| exceeds threshold (rad)."""
-    raise NotImplementedError
+__all__: list[str] = []

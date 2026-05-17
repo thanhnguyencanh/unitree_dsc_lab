@@ -139,7 +139,10 @@ class CommandsCfg:
 class ActionsCfg:
     joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=[".*"],
+        # Exclude wrist joints to enforce the paper's 23-DoF action space.
+        # On a 23-DoF URDF this pattern is a no-op; on the 29-DoF G1 it
+        # prevents the 6 wrist joints from being commanded.
+        joint_names=["(?!.*wrist.*).*"],
         scale=0.25,
         use_default_offset=True,
     )
