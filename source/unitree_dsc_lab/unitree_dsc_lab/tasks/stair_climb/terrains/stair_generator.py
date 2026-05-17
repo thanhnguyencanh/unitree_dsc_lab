@@ -34,6 +34,8 @@ import numpy as np
 import trimesh
 
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
+from isaaclab.terrains.terrain_generator import TerrainGenerator
+from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.dict import dict_to_md5_hash
 
@@ -52,13 +54,21 @@ class StairGT:
 
 
 class StairGTRegistry:
-    """Process-local map from tile-hash -> StairGT.
+    """Process-local maps for per-tile ground truth.
 
-    The function below populates this on every tile build, and the teacher
-    observation term reads it back using the same hash key.
+    Two indexes are kept in sync:
+
+    * ``_store[tile_hash] -> StairGT`` — populated by :func:`stairs_terrain` on
+      every build, keyed by the same ``dict_to_md5_hash(cfg.to_dict())`` value
+      IsaacLab uses for terrain caching.
+    * ``_by_row_col[(row, col)] -> StairGT`` — populated by
+      :class:`StairTerrainGenerator` so the env-side teacher can look up GT by
+      the env's assigned terrain row/col instead of having to recompute the
+      per-tile difficulty hash.
     """
 
     _store: ClassVar[dict[str, StairGT]] = {}
+    _by_row_col: ClassVar[dict[tuple[int, int], StairGT]] = {}
 
     @classmethod
     def put(cls, key: str, gt: StairGT) -> None:
@@ -69,8 +79,17 @@ class StairGTRegistry:
         return cls._store.get(key)
 
     @classmethod
+    def put_by_row_col(cls, row: int, col: int, gt: StairGT) -> None:
+        cls._by_row_col[(int(row), int(col))] = gt
+
+    @classmethod
+    def get_by_row_col(cls, row: int, col: int) -> StairGT | None:
+        return cls._by_row_col.get((int(row), int(col)))
+
+    @classmethod
     def clear(cls) -> None:
         cls._store.clear()
+        cls._by_row_col.clear()
 
     @classmethod
     def hash_for_cfg(cls, cfg: "StairsTerrainCfg") -> str:
@@ -292,6 +311,88 @@ class StairsTerrainTestCfg(StairsTerrainCfg):
 
     h_step_range: tuple[float, float] = (0.18, 0.22)
     yaw_range_rad: tuple[float, float] = (-35.0 * math.pi / 180.0, 35.0 * math.pi / 180.0)
+
+
+# ---------------------------------------------------------------------------
+# Class-locked presets for use with TerrainGenerator proportions
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class FlatLeadInCfg(StairsTerrainCfg):
+    """Flat-only tile (class_id = 0)."""
+
+    class_probs: tuple[float, float, float] = (1.0, 0.0, 0.0)
+
+
+@configclass
+class StairsUpCfg(StairsTerrainCfg):
+    """Stairs-up-only tile (class_id = 1)."""
+
+    class_probs: tuple[float, float, float] = (0.0, 1.0, 0.0)
+
+
+@configclass
+class StairsDownCfg(StairsTerrainCfg):
+    """Stairs-down-only tile (class_id = 2)."""
+
+    class_probs: tuple[float, float, float] = (0.0, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# TerrainGenerator subclass that records the (row, col) -> tile GT mapping
+# ---------------------------------------------------------------------------
+
+
+class StairTerrainGenerator(TerrainGenerator):
+    """A :class:`TerrainGenerator` that records per-tile GT keyed by (row, col).
+
+    IsaacLab's stock ``TerrainGenerator`` calls ``_get_terrain_mesh(difficulty, cfg)``
+    to build a tile, then ``_add_sub_terrain(mesh, origin, row, col, cfg)`` to
+    place it in the grid. We hook both:
+
+    * ``_get_terrain_mesh`` — stash the same ``dict_to_md5_hash(cfg)`` key the
+      function used to register ``StairGT``.
+    * ``_add_sub_terrain`` — pair the stashed key with ``(row, col)`` and copy
+      the ``StairGT`` into ``StairGTRegistry._by_row_col``.
+
+    With this in place the env-side teacher only needs
+    ``terrain.terrain_levels[env_id]`` and ``terrain.terrain_types[env_id]`` to
+    look up the GT, which removes any need to recompute / re-seed the
+    per-tile RNG.
+    """
+
+    def __init__(self, cfg: TerrainGeneratorCfg, device: str = "cpu") -> None:
+        self._pending_hash: str | None = None
+        super().__init__(cfg, device=device)
+
+    def _get_terrain_mesh(self, difficulty: float, cfg: SubTerrainBaseCfg):
+        # Compute the same hash IsaacLab will use, so we can pair it with the
+        # row/col reported in _add_sub_terrain.
+        cfg_for_hash = cfg.copy()
+        cfg_for_hash.difficulty = float(difficulty)  # type: ignore[attr-defined]
+        cfg_for_hash.seed = self.cfg.seed
+        self._pending_hash = dict_to_md5_hash(cfg_for_hash.to_dict())
+        return super()._get_terrain_mesh(difficulty, cfg)
+
+    def _add_sub_terrain(self, mesh, origin, row: int, col: int, sub_terrain_cfg):
+        super()._add_sub_terrain(mesh, origin, row, col, sub_terrain_cfg)
+        if self._pending_hash is not None:
+            gt = StairGTRegistry.get(self._pending_hash)
+            if gt is not None:
+                StairGTRegistry.put_by_row_col(row, col, gt)
+            self._pending_hash = None
+
+
+@configclass
+class StairTerrainGeneratorCfg(TerrainGeneratorCfg):
+    """``TerrainGeneratorCfg`` that uses :class:`StairTerrainGenerator`.
+
+    Drop this in wherever you'd use ``terrain_gen.TerrainGeneratorCfg`` so the
+    per-(row, col) GT registry is populated alongside the meshes.
+    """
+
+    class_type: type = StairTerrainGenerator
 
 
 # ---------------------------------------------------------------------------

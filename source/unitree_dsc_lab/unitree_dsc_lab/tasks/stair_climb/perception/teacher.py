@@ -33,6 +33,7 @@ from unitree_dsc_lab.tasks.stair_climb.terrains.stair_generator import (
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+    from isaaclab.terrains import TerrainImporter
 
 
 @dataclass
@@ -125,6 +126,37 @@ class PrivilegedTeacher:
             tmp.seed = seed
             keys.append(StairGTRegistry.hash_for_cfg(tmp))
         self.refresh_from_keys(env_ids, keys)
+
+    def refresh_from_terrain(
+        self,
+        env_ids: torch.Tensor,
+        terrain: "TerrainImporter",
+    ) -> None:
+        """Populate per-env GT from the live ``TerrainImporter``.
+
+        Reads ``terrain.terrain_levels[env_ids]`` (row) and
+        ``terrain.terrain_types[env_ids]`` (col), then looks up
+        ``StairGTRegistry._by_row_col`` populated by
+        :class:`StairTerrainGenerator` during terrain build.
+
+        This is the recommended hook for the env reset event — it does not
+        require re-deriving the per-tile difficulty hash.
+        """
+        if getattr(terrain, "terrain_levels", None) is None:
+            # plane/usd terrain — no per-tile GT to read; leave defaults.
+            return
+
+        rows = terrain.terrain_levels[env_ids].detach().cpu().tolist()
+        cols = terrain.terrain_types[env_ids].detach().cpu().tolist()
+
+        for env_idx, row, col in zip(env_ids.tolist(), rows, cols):
+            gt = StairGTRegistry.get_by_row_col(int(row), int(col))
+            if gt is None:
+                continue
+            self._gt.class_id[env_idx] = gt.class_id
+            self._gt.h_step[env_idx] = gt.h_step
+            self._gt.d_step[env_idx] = gt.d_step
+            self._gt.theta_yaw_terrain[env_idx] = gt.theta_yaw_terrain
 
 
 __all__ = ["TerrainGroundTruth", "PrivilegedTeacher"]

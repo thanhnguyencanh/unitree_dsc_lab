@@ -40,6 +40,7 @@ A living view of where this replication stands. Tick items off as you finish the
 - [x] **§6 — Gym registration.** Task id `Unitree-G1-23dof-StairClimb-v0` registered (env cfg + PPO runner cfg are stubs).
 - [x] **§8 — `StairsTerrainGenerator` implemented.** Procedural trimesh builder for `{flat, stairs-up, stairs-down}` tiles with paper-range randomization (`h_step`, `d_step`, yaw, lead-in) and `StairsTerrainTestCfg` for the OOD test range. Per-tile GT `(class_id, h_step, d_step, theta_yaw_terrain)` stored in `StairGTRegistry` keyed by IsaacLab's `dict_to_md5_hash(cfg)`. Smoke-tested: determinism + difficulty interpolation + correct tile geometry across all three classes.
 - [x] **§10 — Privileged teacher wired.** `PrivilegedTeacher` holds per-env GPU buffers and exposes `.token(robot_yaw_world) -> z_t` (computes `theta_yaw_current = wrap(robot_yaw - terrain_yaw)`). `terrain_token_privileged` observation term reads from `env.privileged_teacher`. `refresh_from_cfgs(env_ids, [...])` repopulates the buffer on episode reset by looking up the registry.
+- [x] **§8 follow-up — Stair scene + reset event wired.** `StairTerrainGenerator(TerrainGenerator)` subclass records per-`(row, col)` GT in `StairGTRegistry._by_row_col` at terrain build. `StairTerrainGeneratorCfg` (with `class_type=StairTerrainGenerator`) is used by `STAIR_TERRAIN_CFG` in [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py), mixing the three class-locked presets `FlatLeadInCfg`/`StairsUpCfg`/`StairsDownCfg` via `proportion=(0.2, 0.4, 0.4)` across `num_rows=10 × num_cols=20`. Reset-mode event `mdp.reset_privileged_teacher` (a `ManagerTermBase`) attaches `env.privileged_teacher` on first call and on every reset calls `teacher.refresh_from_terrain(env_ids, env.scene.terrain)`. Smoke-tested: every tile has a registry entry, per-row class distribution matches proportions, h_step escalates with curriculum, teacher GT matches the assigned `(row, col)` per env.
 
 ### To-Do — environment
 
@@ -59,10 +60,9 @@ A living view of where this replication stands. Tick items off as you finish the
 
 ### To-Do — simulation & training code
 
-- [ ] **§8** — Plug `StairsTerrainCfg` into the env's `TerrainImporterCfg` (per-row curriculum, `num_rows × num_cols` mix of all three classes) and call `PrivilegedTeacher.refresh_from_cfgs(...)` in the env reset event.
 - [ ] **§9** — Implement `points_to_bev` (vectorized GPU scatter into 6 × 60 × 60).
 - [ ] **§9** — Implement `BEVStudentEncoder` (Conv stack → 128 × 8 × 8 → 4 MLP heads).
-- [ ] **§11** — Fill in `G1StairClimbEnvCfg` (scene, observations, rewards, events, terminations, commands).
+- [x] **§11** — `G1StairClimbEnvCfg` scaffolded (scene with `StairTerrainGeneratorCfg`, proprio + `terrain_token_privileged` obs, joint-pos actions, forward-velocity command, IsaacLab-default rough-locomotion reward stack, reset/startup/interval events incl. `reset_privileged_teacher`, terminations, `terrain_levels_vel` curriculum). Stair-specific shaping (`swing_clearance_bonus`/`step_alignment_bonus`) is still pending.
 - [ ] **§11** — Implement `swing_clearance_bonus` and `step_alignment_bonus` rewards.
 - [ ] **§11** — Implement `StairClimbActorCritic` compatible with rsl_rl `OnPolicyRunner`.
 - [ ] **§12** — Implement `ThreeStagePPORunner` (stage-1 PPO loop, stage-2 perception SL, stage-3 joint loss).
@@ -309,28 +309,53 @@ Module API:
 
 ```python
 from unitree_dsc_lab.tasks.stair_climb.terrains import (
-    StairsTerrainCfg,        # train ranges (h ∈ [0.12, 0.16] m, yaw ±25°)
-    StairsTerrainTestCfg,    # OOD ranges  (h ∈ [0.18, 0.22] m, yaw ±35°)
-    stairs_terrain,          # IsaacLab function callback (difficulty, cfg) -> (meshes, origin)
-    StairGTRegistry,         # process-local tile_hash -> StairGT lookup
-    lookup_tile_gt,          # env-side helper to recover GT for a given (cfg, difficulty, seed)
+    StairsTerrainCfg,            # base config (paper train ranges)
+    StairsTerrainTestCfg,        # OOD ranges (h ∈ [0.18, 0.22] m, yaw ±35°)
+    FlatLeadInCfg,               # class-locked: flat only
+    StairsUpCfg,                 # class-locked: stairs-up only
+    StairsDownCfg,               # class-locked: stairs-down only
+    stairs_terrain,              # IsaacLab function callback (difficulty, cfg) -> (meshes, origin)
+    StairGTRegistry,             # process-local tile_hash + (row, col) -> StairGT lookup
+    StairTerrainGenerator,       # TerrainGenerator subclass that records (row, col) GT
+    StairTerrainGeneratorCfg,    # TerrainGeneratorCfg with class_type=StairTerrainGenerator
+    lookup_tile_gt,              # helper to recover GT for a given (cfg, difficulty, seed)
 )
 ```
 
-Plug into an env via `TerrainImporterCfg`:
+Plug into an env via `TerrainImporterCfg` — mix the three class-locked presets by `proportion`:
 
 ```python
-from isaaclab.terrains import TerrainGeneratorCfg
+from isaaclab.terrains import TerrainImporterCfg
+from unitree_dsc_lab.tasks.stair_climb.terrains import (
+    StairTerrainGeneratorCfg, FlatLeadInCfg, StairsUpCfg, StairsDownCfg,
+)
 
-stair_terrain_cfg = TerrainGeneratorCfg(
+STAIR_TERRAIN_CFG = StairTerrainGeneratorCfg(
     size=(8.0, 4.0),
-    num_rows=10, num_cols=20,        # 10 difficulty levels x 20 mixes per row
+    num_rows=10, num_cols=20,     # 10 difficulty levels x 20 tiles per row
     curriculum=True,
-    sub_terrains={"stairs": StairsTerrainCfg(size=(8.0, 4.0))},
+    sub_terrains={
+        "flat":        FlatLeadInCfg(proportion=0.2),
+        "stairs_up":   StairsUpCfg(proportion=0.4),
+        "stairs_down": StairsDownCfg(proportion=0.4),
+    },
+)
+
+terrain = TerrainImporterCfg(
+    prim_path="/World/ground",
+    terrain_type="generator",
+    terrain_generator=STAIR_TERRAIN_CFG,
+    max_init_terrain_level=STAIR_TERRAIN_CFG.num_rows - 1,
+    # ...
 )
 ```
 
-Per-tile ground truth `(s_t, h_step, d_step, theta_yaw_terrain)` is captured in `StairGTRegistry` during `stairs_terrain()`, keyed by `dict_to_md5_hash(cfg.to_dict())` — the same hash IsaacLab uses for its terrain cache. The env-side `PrivilegedTeacher` (§10) reads from this registry on reset.
+Two indexes are kept in sync during terrain build:
+
+- `StairGTRegistry._store[tile_hash]` — populated by `stairs_terrain()` keyed by `dict_to_md5_hash(cfg.to_dict())` (same hash IsaacLab uses for its terrain cache).
+- `StairGTRegistry._by_row_col[(row, col)]` — populated by `StairTerrainGenerator._add_sub_terrain()`. This is what the env-side teacher reads via `terrain.terrain_levels[env_id]` / `terrain.terrain_types[env_id]`, so no per-tile difficulty re-derivation is required.
+
+A full reference wiring (terrain + observations + reset event + commands + rewards) lives in [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py::G1StairClimbEnvCfg`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py).
 
 > The robot spawn origin is the centre of the lead-in flat patch, **after** the yaw rotation. On `stairs-down` tiles the spawn is elevated (top of the staircase); on `stairs-up` and `flat` it's at z = 0.
 
@@ -338,22 +363,24 @@ Per-tile ground truth `(s_t, h_step, d_step, theta_yaw_terrain)` is captured in 
 
 ## 9. BEV Perception Module
 
-[`tasks/stair_climb/perception/bev.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/bev.py) — pure-tensor (GPU) projection. Per the paper:
+**Status: stubs in place; bodies not yet implemented.**
+
+[`tasks/stair_climb/perception/bev.py::points_to_bev`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/bev.py) — pure-tensor (GPU) projection. Per the paper:
 
 - Region: 3 m × 3 m, resolution 0.05 m → grid 60 × 60
-- Channels (6): max(z), min(z), mean(z), max-min, std(z), normalized point density
+- Channels (6): `max(z)`, `min(z)`, `mean(z)`, `max - min`, `std(z)`, normalized point density
 - Empty cells: zero-filled
-- Frame: robot-centric, X forward, Y left
+- Frame: robot-centric, +X forward, +Y left
 
 ```python
-# Already stubbed in tasks/stair_climb/perception/bev.py
-def points_to_bev(points: Tensor[N, 3]) -> Tensor[6, 60, 60]:
+def points_to_bev(points: torch.Tensor) -> torch.Tensor:  # (N, 3) -> (6, 60, 60)
     ...
 ```
 
-[`tasks/stair_climb/perception/encoder.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/encoder.py) — `BEVStudentEncoder` CNN matching paper specs:
+[`tasks/stair_climb/perception/encoder.py::BEVStudentEncoder`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/encoder.py) — CNN matching paper specs:
 - Multi-layer Conv2d + BatchNorm + ReLU, progressive downsampling
 - Output `F_enc ∈ R^{128×8×8}` then MLP heads → `(logits_class[3], h_step, d_step, theta_yaw)`
+- Replaces `mdp.terrain_token_privileged` in `ObservationsCfg.PolicyCfg` once Stage 2 kicks in.
 
 ---
 
@@ -363,11 +390,16 @@ def points_to_bev(points: Tensor[N, 3]) -> Tensor[6, 60, 60]:
 
 - [`tasks/stair_climb/perception/teacher.py::PrivilegedTeacher`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/teacher.py) holds per-env GPU buffers `(class_id, h_step, d_step, theta_yaw_terrain)` and exposes:
   - `.token(robot_yaw_world) -> (num_envs, 4)` — returns `z_t` with `theta_yaw_current = wrap(robot_yaw - terrain_yaw)`.
-  - `.refresh_from_cfgs(env_ids, [(cfg, difficulty, seed), ...])` — call from the env reset event to repopulate buffers from `StairGTRegistry`.
-- [`tasks/stair_climb/mdp/observations.py::terrain_token_privileged`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/observations.py) — observation term that reads from `env.privileged_teacher`. **Hook required**: attach the teacher during env build:
+  - `.refresh_from_terrain(env_ids, terrain)` — **preferred** reset-time refresh. Reads `terrain.terrain_levels[env_ids]` / `terrain.terrain_types[env_ids]` and pulls from `StairGTRegistry._by_row_col` (populated by `StairTerrainGenerator`).
+  - `.refresh_from_cfgs(env_ids, [(cfg, difficulty, seed), ...])` — escape hatch when you have explicit per-env cfg triples instead of a live `TerrainImporter`.
+- [`tasks/stair_climb/mdp/observations.py::terrain_token_privileged`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/observations.py) — observation term that reads from `env.privileged_teacher`.
+- [`tasks/stair_climb/mdp/events.py::reset_privileged_teacher`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/events.py) — `ManagerTermBase` event term that wires both halves: on construction it attaches `env.privileged_teacher`; on every reset it calls `teacher.refresh_from_terrain(env_ids, env.scene.terrain)`. Drop it into the env's `EventCfg`:
 
   ```python
-  env.privileged_teacher = PrivilegedTeacher(num_envs=env.num_envs, device=env.device)
+  reset_privileged_teacher = EventTerm(
+      func=mdp.reset_privileged_teacher,
+      mode="reset",
+  )
   ```
 
 Student loss (Eq. 8 of the paper):
@@ -382,19 +414,26 @@ L_terrain = 0.6 * F.cross_entropy(logits_s, s_gt) \
 
 ## 11. PPO Policy: Observations, Actions, Rewards
 
-**Observation** (per `Eq. 1`):
+**Status: env cfg scaffolded** — [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py::G1StairClimbEnvCfg`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py) wires the scene (`StairTerrainGeneratorCfg` + G1 articulation + contact sensor), observations (policy + critic groups), actions, commands, rewards, events (incl. `reset_privileged_teacher`), terminations, and `terrain_levels_vel` curriculum. The two paper-specific shaping rewards remain as stubs in [`mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py).
+
+**Observation** (per Eq. 1):
 ```
-o_prop = [base_lin_vel, base_ang_vel, projected_gravity,
-          joint_pos - default, joint_vel, last_action,
-          foot_contact_flags, command_vel_xy_yaw]
-o_t    = concat(o_prop, z_t)   # z_t comes from student (or teacher in stage 1)
+o_prop = [base_ang_vel, projected_gravity, velocity_commands,
+          joint_pos - default, joint_vel, last_action]   # critic group also gets base_lin_vel
+o_t    = concat(o_prop, z_t)                              # z_t = mdp.terrain_token_privileged
 ```
 
-**Action:** target joint positions offset from default → wrapped by PD (`Kp ≈ 100–200`, `Kd ≈ 2–5`, joint-specific from Unitree spec).
+> The paper also lists `foot_contact_flags` in `o_prop`. Not yet wired — add a contact-flag obs term keyed to the ankle-roll bodies in [`mdp/observations.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/observations.py) and a corresponding `ObsTerm` in `PolicyCfg`.
 
-**Rewards:** use IsaacLab's default `rough-locomotion` weighted reward as the paper specifies, then add two stair-specific shaping terms that proved critical in reproduction (already stubbed in [`tasks/stair_climb/mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py)):
+**Action:** `mdp.JointPositionActionCfg(joint_names=[".*"], scale=0.25, use_default_offset=True)` — target joint offsets from default, wrapped by IsaacLab's built-in PD (`Kp`/`Kd` come from `G1_23DOF_CFG.actuators`, sourced from the Unitree spec).
+
+**Commands:** `mdp.UniformVelocityCommandCfg` with forward-only ranges `lin_vel_x ∈ [0.0, 0.7] m/s`, small ang_vel_z noise; resampling every 8–12 s.
+
+**Rewards:** IsaacLab's default rough-locomotion stack (`track_lin_vel_xy_exp`, `track_ang_vel_z_exp`, `is_alive`, `lin_vel_z_l2`, `ang_vel_xy_l2`, `flat_orientation_l2`, `base_height_l2`, `joint_vel_l2`, `joint_acc_l2`, `action_rate_l2`, `joint_pos_limits`, arm/waist `joint_deviation_l1`, `undesired_contacts`). Plus two paper-specific shaping terms still to implement (stubs in [`mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py)):
 - `swing_clearance_bonus` — reward foot apex height ≥ `h_step + 5 cm` during stair-up
 - `step_alignment_bonus`  — reward landing inside `d_step` window after stair edge
+
+Once those land, register them in `RewardsCfg` alongside the existing terms.
 
 ---
 
@@ -570,4 +609,4 @@ ros2 topic pub /cmd_vel geometry_msgs/Twist "{linear: {x: 0.3}}"
 
 ---
 
-*Last updated: 2026-05-17 — §6 layout switched to `unitree_dsc_lab/`, §8 `StairsTerrainGenerator` + §10 `PrivilegedTeacher` implemented and ticked in §0, link targets fixed for in-repo guide location. Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
+*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded with the three class-locked presets mixed by proportion); §9 / §11 prose refreshed to match current code state and call out the remaining gaps (BEV bodies, `swing_clearance_bonus`/`step_alignment_bonus`, `foot_contact_flags` obs). Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
