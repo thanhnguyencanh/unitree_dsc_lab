@@ -78,6 +78,13 @@ def main() -> None:
 
     runner.learn_stage1(args_cli.max_iterations)
 
+    # --- evaluate Stage-1 success rate (target > 0.85) ---
+    print("[Stage 1] Evaluating success rate …")
+    success_rate = runner.evaluate_success_rate(num_episodes=200)
+    print(f"[Stage 1] success_rate = {success_rate:.3f}  (target > 0.85)")
+    runner.save(os.path.join(log_dir, "model_final.pt"))
+    print(f"[Stage 1] Final checkpoint saved to {log_dir}/model_final.pt")
+
     env.close()
     simulation_app.close()
 

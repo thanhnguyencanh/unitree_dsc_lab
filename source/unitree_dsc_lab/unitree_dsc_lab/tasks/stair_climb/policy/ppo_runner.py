@@ -264,6 +264,54 @@ class ThreeStagePPORunner(OnPolicyRunner):
             self.logger.stop_logging_writer()
 
     # -----------------------------------------------------------------------
+    # Stage 1 evaluation
+    # -----------------------------------------------------------------------
+
+    @torch.no_grad()
+    def evaluate_success_rate(
+        self,
+        num_episodes: int = 200,
+        min_level_frac: float = 0.8,
+    ) -> float:
+        """Estimate Stage-1 success rate from terrain-level progress.
+
+        Runs the frozen policy until ``num_episodes`` env episodes complete, then
+        returns the fraction that ended at ``terrain_level >= min_level_frac *
+        max_level``.  Returns ``nan`` if the terrain has no level tracking.
+
+        Args:
+            num_episodes: Minimum number of completed episodes to collect.
+            min_level_frac: Fraction of max terrain levels considered a success
+                (default 0.8 ≈ reaching the top-2 difficulty rows out of 10).
+        """
+        env_unwrapped = self.env.unwrapped
+        terrain = getattr(getattr(env_unwrapped, "scene", None), "terrain", None)
+        if terrain is None or not hasattr(terrain, "terrain_levels"):
+            return float("nan")
+
+        max_level = int(terrain.cfg.terrain_generator.num_rows) - 1
+        threshold = int(round(max_level * min_level_frac))
+
+        self.alg.eval_mode()
+        obs = self.env.get_observations().to(self.device)
+        successes = 0
+        total = 0
+
+        while total < num_episodes:
+            with torch.inference_mode():
+                actions = self.alg.act(obs)
+                obs, _, dones, _ = self.env.step(actions.to(self.env.device))
+                obs = obs.to(self.device)
+            done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
+            if done_ids.numel() > 0:
+                levels = terrain.terrain_levels[done_ids.cpu()]
+                successes += int((levels >= threshold).sum().item())
+                total += int(done_ids.numel())
+
+        self.alg.train_mode()
+        return successes / max(total, 1)
+
+    # -----------------------------------------------------------------------
     # Checkpoint helpers (extend parent to include encoder)
     # -----------------------------------------------------------------------
 

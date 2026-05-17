@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import euler_xyz_from_quat
 
 if TYPE_CHECKING:
@@ -48,4 +49,19 @@ def terrain_token_privileged(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return teacher.token(_base_yaw(env))
 
 
-__all__ = ["terrain_token_privileged"]
+def foot_contact_flags(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Binary foot-contact flags (1=in contact, 0=in air), shape (num_envs, 2).
+
+    Channels follow the contact-sensor body resolution order (L then R for G1).
+    The ObservationManager resolves ``sensor_cfg.body_ids`` before the first call.
+    """
+    sensor = env.scene[sensor_cfg.name]
+    forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]  # (num_envs, 2, 3)
+    return (torch.linalg.norm(forces, dim=-1) > threshold).float()
+
+
+__all__ = ["terrain_token_privileged", "foot_contact_flags"]
