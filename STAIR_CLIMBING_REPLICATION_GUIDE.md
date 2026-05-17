@@ -42,6 +42,7 @@ A living view of where this replication stands. Tick items off as you finish the
 - [x] **§10 — Privileged teacher wired.** `PrivilegedTeacher` holds per-env GPU buffers and exposes `.token(robot_yaw_world) -> z_t` (computes `theta_yaw_current = wrap(robot_yaw - terrain_yaw)`). `terrain_token_privileged` observation term reads from `env.privileged_teacher`. `refresh_from_cfgs(env_ids, [...])` repopulates the buffer on episode reset by looking up the registry.
 - [x] **§8 follow-up — Stair scene + reset event wired.** `StairTerrainGenerator(TerrainGenerator)` subclass records per-`(row, col)` GT in `StairGTRegistry._by_row_col` at terrain build. `StairTerrainGeneratorCfg` (with `class_type=StairTerrainGenerator`) is used by `STAIR_TERRAIN_CFG` in [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py), mixing the three class-locked presets `FlatLeadInCfg`/`StairsUpCfg`/`StairsDownCfg` via `proportion=(0.2, 0.4, 0.4)` across `num_rows=10 × num_cols=20`. Reset-mode event `mdp.reset_privileged_teacher` (a `ManagerTermBase`) attaches `env.privileged_teacher` on first call and on every reset calls `teacher.refresh_from_terrain(env_ids, env.scene.terrain)`. Smoke-tested: every tile has a registry entry, per-row class distribution matches proportions, h_step escalates with curriculum, teacher GT matches the assigned `(row, col)` per env.
 - [x] **§9 — `points_to_bev` implemented.** Pure-tensor (CPU/GPU) projection from `(N, 3)` or `(B, N, 3)` point clouds in robot frame to a `(6, 60, 60)` / `(B, 6, 60, 60)` BEV. Single set of `scatter_add_` / `scatter_reduce_` calls on flattened cell indices — no Python loop over envs. Supports custom `x_range` / `y_range` / `resolution` and an optional `valid_mask` for padded ragged clouds. Channels: `[max, min, mean, max - min, std, density]`; density is per-batch-normalized; empty cells zero-filled. Smoke-tested: cell math on single + multi-point clouds, OOR drop, empty cloud, batched-vs-unbatched parity, density normalization.
+- [x] **§9 — `BEVStudentEncoder` implemented.** Conv trunk `Conv(6→32) → Conv(32→64) → Conv(64→128)` (all `k=3, s=2, p=1`, BN + ReLU) takes a `(B, 6, 60, 60)` BEV down to `F_enc ∈ R^{B×128×8×8}`; shared MLP `Linear(8192→256→128)` then four heads emit `(class_logits[3], h_step, d_step, theta_yaw)`. Returns a `BEVPrediction` dataclass exposing `feat=F_enc` for joint training. `predict_token(bev) → (B, 4)` matches `PrivilegedTeacher.token()`'s layout so swapping student for teacher in `ObservationsCfg.PolicyCfg` is a one-line change. `terrain_loss(pred, target)` implements Eq. 8 (`0.6·CE + 1.0·L1(h) + 1.0·L1(d)`); yaw head is excluded by design. ≈2.2 M params. Smoke-tested: forward shapes, F_enc shape, `predict_token` shape + class range, loss finite, gradient isolation for the yaw head, gradients reach class/h/d heads + conv trunk, end-to-end with a real `points_to_bev` output.
 
 ### To-Do — environment
 
@@ -61,7 +62,6 @@ A living view of where this replication stands. Tick items off as you finish the
 
 ### To-Do — simulation & training code
 
-- [ ] **§9** — Implement `BEVStudentEncoder` (Conv stack → 128 × 8 × 8 → 4 MLP heads).
 - [x] **§11** — `G1StairClimbEnvCfg` scaffolded (scene with `StairTerrainGeneratorCfg`, proprio + `terrain_token_privileged` obs, joint-pos actions, forward-velocity command, IsaacLab-default rough-locomotion reward stack, reset/startup/interval events incl. `reset_privileged_teacher`, terminations, `terrain_levels_vel` curriculum). Stair-specific shaping (`swing_clearance_bonus`/`step_alignment_bonus`) is still pending.
 - [ ] **§11** — Implement `swing_clearance_bonus` and `step_alignment_bonus` rewards.
 - [ ] **§11** — Implement `StairClimbActorCritic` compatible with rsl_rl `OnPolicyRunner`.
@@ -363,7 +363,7 @@ A full reference wiring (terrain + observations + reset event + commands + rewar
 
 ## 9. BEV Perception Module
 
-**Status: `points_to_bev` implemented; `BEVStudentEncoder` body still a stub.**
+**Status: `points_to_bev` + `BEVStudentEncoder` + `terrain_loss` implemented.**
 
 ### 9.1 `points_to_bev` — point cloud → 6-channel BEV
 
@@ -392,11 +392,46 @@ bev = points_to_bev(padded_points, valid_mask=mask)
 
 ### 9.2 `BEVStudentEncoder` — BEV → 4-D token
 
-[`tasks/stair_climb/perception/encoder.py::BEVStudentEncoder`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/encoder.py) — CNN matching paper specs (body still TODO):
+[`tasks/stair_climb/perception/encoder.py::BEVStudentEncoder`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/encoder.py):
 
-- Multi-layer Conv2d + BatchNorm + ReLU, progressive downsampling
-- Output `F_enc ∈ R^{128×8×8}` then MLP heads → `(logits_class[3], h_step, d_step, theta_yaw)`
-- Replaces `mdp.terrain_token_privileged` in `ObservationsCfg.PolicyCfg` once Stage 2 kicks in.
+```
+(B, 6, 60, 60)
+    │
+    │  Conv(6→32, k=3, s=2, p=1) + BN + ReLU            (B, 32, 30, 30)
+    │  Conv(32→64, k=3, s=2, p=1) + BN + ReLU           (B, 64, 15, 15)
+    │  Conv(64→128, k=3, s=2, p=1) + BN + ReLU          (B, 128, 8, 8)  = F_enc
+    │
+    │  Flatten + Linear(8192→256) + ReLU + Linear(256→128) + ReLU
+    │
+    ├── head_class  (Linear 128→3)    → logits_class (B, 3)
+    ├── head_h      (Linear 128→1)    → h_step       (B,)
+    ├── head_d      (Linear 128→1)    → d_step       (B,)
+    └── head_yaw    (Linear 128→1)    → theta_yaw    (B,)   [sanity head]
+```
+
+≈ 2.2 M params. `forward(bev)` returns a `BEVPrediction` dataclass with the four head outputs plus `feat=F_enc` (exposed for Stage 3 joint training).
+
+**Drop-in for the teacher in `PolicyCfg`** — `predict_token(bev)` returns `(B, 4)` `[class_id, h, d, theta_yaw]` matching the layout of `PrivilegedTeacher.token()`:
+
+```python
+from unitree_dsc_lab.tasks.stair_climb.perception import BEVStudentEncoder
+
+encoder = BEVStudentEncoder().to(device).eval()
+z_t = encoder.predict_token(bev_batch)        # (B, 4), same channels as teacher.token
+```
+
+**Stage 2 supervision** (paper Eq. 8) — `terrain_loss(pred, target)`:
+
+```python
+from unitree_dsc_lab.tasks.stair_climb.perception import terrain_loss
+
+# target = teacher.token(robot_yaw_world)     # (B, 4)
+losses = terrain_loss(pred, target)
+losses["total"].backward()
+# losses["cls"], losses["h"], losses["d"] available for logging
+```
+
+Yaw is **not** in `terrain_loss` (paper §III-A.3 — yaw is taken from IMU, the yaw head is trained only as a sanity probe).
 
 ---
 
@@ -418,7 +453,8 @@ bev = points_to_bev(padded_points, valid_mask=mask)
   )
   ```
 
-Student loss (Eq. 8 of the paper):
+Student loss (Eq. 8 of the paper) — implemented in [`perception/encoder.py::terrain_loss`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/encoder.py):
+
 ```python
 L_terrain = 0.6 * F.cross_entropy(logits_s, s_gt) \
           + 1.0 * F.smooth_l1_loss(h_pred, h_gt) \
@@ -625,4 +661,4 @@ ros2 topic pub /cmd_vel geometry_msgs/Twist "{linear: {x: 0.3}}"
 
 ---
 
-*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded with the three class-locked presets mixed by proportion); §9 `points_to_bev` implemented (vectorized scatter, CPU/GPU, batched + valid-mask support, smoke-tested); §11 prose refreshed. Remaining gaps: `BEVStudentEncoder` body, `swing_clearance_bonus` / `step_alignment_bonus` rewards, `foot_contact_flags` obs. Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
+*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded); §9 `points_to_bev` + `BEVStudentEncoder` + `terrain_loss` implemented (≈ 2.2 M params, `predict_token` matches teacher layout, yaw head isolated from `terrain_loss`, smoke-tested end-to-end with real BEVs); §11 prose refreshed. Remaining gaps: `swing_clearance_bonus` / `step_alignment_bonus` rewards, `foot_contact_flags` obs, `StairClimbActorCritic`, three-stage runner. Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
