@@ -41,6 +41,7 @@ A living view of where this replication stands. Tick items off as you finish the
 - [x] **§8 — `StairsTerrainGenerator` implemented.** Procedural trimesh builder for `{flat, stairs-up, stairs-down}` tiles with paper-range randomization (`h_step`, `d_step`, yaw, lead-in) and `StairsTerrainTestCfg` for the OOD test range. Per-tile GT `(class_id, h_step, d_step, theta_yaw_terrain)` stored in `StairGTRegistry` keyed by IsaacLab's `dict_to_md5_hash(cfg)`. Smoke-tested: determinism + difficulty interpolation + correct tile geometry across all three classes.
 - [x] **§10 — Privileged teacher wired.** `PrivilegedTeacher` holds per-env GPU buffers and exposes `.token(robot_yaw_world) -> z_t` (computes `theta_yaw_current = wrap(robot_yaw - terrain_yaw)`). `terrain_token_privileged` observation term reads from `env.privileged_teacher`. `refresh_from_cfgs(env_ids, [...])` repopulates the buffer on episode reset by looking up the registry.
 - [x] **§8 follow-up — Stair scene + reset event wired.** `StairTerrainGenerator(TerrainGenerator)` subclass records per-`(row, col)` GT in `StairGTRegistry._by_row_col` at terrain build. `StairTerrainGeneratorCfg` (with `class_type=StairTerrainGenerator`) is used by `STAIR_TERRAIN_CFG` in [`tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/stair_env_cfg.py), mixing the three class-locked presets `FlatLeadInCfg`/`StairsUpCfg`/`StairsDownCfg` via `proportion=(0.2, 0.4, 0.4)` across `num_rows=10 × num_cols=20`. Reset-mode event `mdp.reset_privileged_teacher` (a `ManagerTermBase`) attaches `env.privileged_teacher` on first call and on every reset calls `teacher.refresh_from_terrain(env_ids, env.scene.terrain)`. Smoke-tested: every tile has a registry entry, per-row class distribution matches proportions, h_step escalates with curriculum, teacher GT matches the assigned `(row, col)` per env.
+- [x] **§9 — `points_to_bev` implemented.** Pure-tensor (CPU/GPU) projection from `(N, 3)` or `(B, N, 3)` point clouds in robot frame to a `(6, 60, 60)` / `(B, 6, 60, 60)` BEV. Single set of `scatter_add_` / `scatter_reduce_` calls on flattened cell indices — no Python loop over envs. Supports custom `x_range` / `y_range` / `resolution` and an optional `valid_mask` for padded ragged clouds. Channels: `[max, min, mean, max - min, std, density]`; density is per-batch-normalized; empty cells zero-filled. Smoke-tested: cell math on single + multi-point clouds, OOR drop, empty cloud, batched-vs-unbatched parity, density normalization.
 
 ### To-Do — environment
 
@@ -60,7 +61,6 @@ A living view of where this replication stands. Tick items off as you finish the
 
 ### To-Do — simulation & training code
 
-- [ ] **§9** — Implement `points_to_bev` (vectorized GPU scatter into 6 × 60 × 60).
 - [ ] **§9** — Implement `BEVStudentEncoder` (Conv stack → 128 × 8 × 8 → 4 MLP heads).
 - [x] **§11** — `G1StairClimbEnvCfg` scaffolded (scene with `StairTerrainGeneratorCfg`, proprio + `terrain_token_privileged` obs, joint-pos actions, forward-velocity command, IsaacLab-default rough-locomotion reward stack, reset/startup/interval events incl. `reset_privileged_teacher`, terminations, `terrain_levels_vel` curriculum). Stair-specific shaping (`swing_clearance_bonus`/`step_alignment_bonus`) is still pending.
 - [ ] **§11** — Implement `swing_clearance_bonus` and `step_alignment_bonus` rewards.
@@ -363,21 +363,37 @@ A full reference wiring (terrain + observations + reset event + commands + rewar
 
 ## 9. BEV Perception Module
 
-**Status: stubs in place; bodies not yet implemented.**
+**Status: `points_to_bev` implemented; `BEVStudentEncoder` body still a stub.**
 
-[`tasks/stair_climb/perception/bev.py::points_to_bev`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/bev.py) — pure-tensor (GPU) projection. Per the paper:
+### 9.1 `points_to_bev` — point cloud → 6-channel BEV
 
-- Region: 3 m × 3 m, resolution 0.05 m → grid 60 × 60
-- Channels (6): `max(z)`, `min(z)`, `mean(z)`, `max - min`, `std(z)`, normalized point density
-- Empty cells: zero-filled
-- Frame: robot-centric, +X forward, +Y left
+[`tasks/stair_climb/perception/bev.py::points_to_bev`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/bev.py) — single pass of vectorized `scatter_add_` / `scatter_reduce_` calls, runs on CPU or GPU, supports batched inputs without a Python loop over envs.
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `x_range` | `(0.0, 3.0)` m | +X forward — stairs-ahead footprint |
+| `y_range` | `(-1.5, 1.5)` m | +Y left, centred on robot |
+| `resolution` | `0.05` m | 60 cells per 3 m |
+| `valid_mask` | `None` | optional `(N,)` / `(B, N)` bool mask for padded ragged clouds |
+
+Channels (in this order): `[max(z), min(z), mean(z), max - min, std(z), density]`. Empty cells are zero-filled; density is per-batch-normalized so the busiest cell is 1.0.
 
 ```python
-def points_to_bev(points: torch.Tensor) -> torch.Tensor:  # (N, 3) -> (6, 60, 60)
-    ...
+from unitree_dsc_lab.tasks.stair_climb.perception.bev import points_to_bev
+
+# Unbatched: (N, 3) -> (6, 60, 60)
+bev = points_to_bev(robot_centric_points)
+
+# Batched ragged: (B, max_N, 3) + (B, max_N) mask -> (B, 6, 60, 60)
+bev = points_to_bev(padded_points, valid_mask=mask)
 ```
 
-[`tasks/stair_climb/perception/encoder.py::BEVStudentEncoder`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/encoder.py) — CNN matching paper specs:
+> The point cloud must already be in the **robot frame** (+X forward, +Y left, +Z up). The on-board deploy node ([`deploy/pointcloud_to_bev.py`](deploy/pointcloud_to_bev.py)) is responsible for transforming RealSense / Livox points into this frame before calling the encoder.
+
+### 9.2 `BEVStudentEncoder` — BEV → 4-D token
+
+[`tasks/stair_climb/perception/encoder.py::BEVStudentEncoder`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/perception/encoder.py) — CNN matching paper specs (body still TODO):
+
 - Multi-layer Conv2d + BatchNorm + ReLU, progressive downsampling
 - Output `F_enc ∈ R^{128×8×8}` then MLP heads → `(logits_class[3], h_step, d_step, theta_yaw)`
 - Replaces `mdp.terrain_token_privileged` in `ObservationsCfg.PolicyCfg` once Stage 2 kicks in.
@@ -609,4 +625,4 @@ ros2 topic pub /cmd_vel geometry_msgs/Twist "{linear: {x: 0.3}}"
 
 ---
 
-*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded with the three class-locked presets mixed by proportion); §9 / §11 prose refreshed to match current code state and call out the remaining gaps (BEV bodies, `swing_clearance_bonus`/`step_alignment_bonus`, `foot_contact_flags` obs). Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
+*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded with the three class-locked presets mixed by proportion); §9 `points_to_bev` implemented (vectorized scatter, CPU/GPU, batched + valid-mask support, smoke-tested); §11 prose refreshed. Remaining gaps: `BEVStudentEncoder` body, `swing_clearance_bonus` / `step_alignment_bonus` rewards, `foot_contact_flags` obs. Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
