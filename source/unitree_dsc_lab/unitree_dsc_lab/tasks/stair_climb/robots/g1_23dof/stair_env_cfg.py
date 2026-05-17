@@ -199,6 +199,15 @@ class ObservationsCfg:
         )
         terrain_token = ObsTerm(func=mdp.terrain_token_privileged)
 
+        # Privileged: raw forward height scan (3 m × 3 m BEV). The policy only
+        # sees a 4-D summary via terrain_token; the critic gets the full grid
+        # to tighten value estimates on the upcoming stair geometry.
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            clip=(-1.0, 1.0),
+        )
+
         def __post_init__(self):
             self.concatenate_terms = True
 
@@ -225,12 +234,27 @@ class RewardsCfg:
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
 
     # base
-    lin_vel_z = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
+    # lin_vel_z disabled: vertical motion is intrinsic to stair traversal and a
+    # penalty here fights the task. Matches IsaacLab rough template.
+    lin_vel_z = RewTerm(func=mdp.lin_vel_z_l2, weight=0.0)
     ang_vel_xy = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    flat_orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
-    base_height = RewTerm(func=mdp.base_height_l2, weight=-10.0, params={"target_height": 0.78})
+    flat_orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
+    # Terrain-relative base height: sensor_cfg adjusts the target by the local
+    # ground height so CoM tracks the staircase instead of a fixed world z.
+    # NOTE: the height_scanner is offset 1.5 m forward for BEV; the adjustment
+    # is therefore biased toward upcoming terrain. Acceptable for shaping but
+    # consider a dedicated downward scanner under torso_link if this dominates.
+    base_height = RewTerm(
+        func=mdp.base_height_l2,
+        weight=-1.0,
+        params={
+            "target_height": 0.78,
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+        },
+    )
 
     # joint regularization
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-0.001)
