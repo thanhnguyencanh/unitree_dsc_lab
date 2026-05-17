@@ -45,6 +45,7 @@ A living view of where this replication stands. Tick items off as you finish the
 - [x] **§9 — `BEVStudentEncoder` implemented.** Conv trunk `Conv(6→32) → Conv(32→64) → Conv(64→128)` (all `k=3, s=2, p=1`, BN + ReLU) takes a `(B, 6, 60, 60)` BEV down to `F_enc ∈ R^{B×128×8×8}`; shared MLP `Linear(8192→256→128)` then four heads emit `(class_logits[3], h_step, d_step, theta_yaw)`. Returns a `BEVPrediction` dataclass exposing `feat=F_enc` for joint training. `predict_token(bev) → (B, 4)` matches `PrivilegedTeacher.token()`'s layout so swapping student for teacher in `ObservationsCfg.PolicyCfg` is a one-line change. `terrain_loss(pred, target)` implements Eq. 8 (`0.6·CE + 1.0·L1(h) + 1.0·L1(d)`); yaw head is excluded by design. ≈2.2 M params. Smoke-tested: forward shapes, F_enc shape, `predict_token` shape + class range, loss finite, gradient isolation for the yaw head, gradients reach class/h/d heads + conv trunk, end-to-end with a real `points_to_bev` output.
 - [x] **§11 — `swing_clearance_bonus` + `step_alignment_bonus` implemented.** Both are stateful `ManagerTermBase` classes in [`tasks/stair_climb/mdp/rewards.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/mdp/rewards.py) and read per-env GT from `env.privileged_teacher`. `swing_clearance_bonus` tracks `lift_off_z` per foot from in-contact frames and emits a dense per-step bonus `sum_feet(clamp(foot_z − lift_off_z − (h_step + clearance_margin), 0))` while the foot is airborne — gated to `class_id == 1` (stairs-up). `step_alignment_bonus` tracks each foot's last touchdown xy in the world frame and, on every first-contact event (`ContactSensor.compute_first_contact(step_dt)`), measures forward distance from the previous touchdown projected onto the stair-forward axis `[cos(θ_yaw_terrain), sin(θ_yaw_terrain)]` and rewards a Gaussian `exp(−err² / window_margin²)` with `err = projected_delta − d_step` — gated to `class_id ∈ {1, 2}`. Both implement `reset(env_ids)` to clear per-env state on episode reset. Wired into `RewardsCfg` (`swing_clearance` weight 2.0, `step_alignment` weight 1.0) keyed on `.*_ankle_roll_link`. Smoke-tested: shape + first-call seeding, class masking (flat zero / stairs-up active / stairs-down behavior), reset clears per-env state, Gaussian peak at exact `d_step`, `e^−1` at one-window-margin offset, terrain-yaw rotation aligns the axis to `+Y`, no-reward path when `compute_first_contact` is False, graceful zero when `env.privileged_teacher` is absent.
 - [x] **§11 — `StairClimbActorCritic` wired for rsl-rl OnPolicyRunner.** Thin `rsl_rl.models.MLPModel` subclass in [`tasks/stair_climb/policy/actor_critic.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/policy/actor_critic.py) used for **both** the actor (Gaussian distribution, `output_dim=num_actions`) and the critic (deterministic, `output_dim=1`) — the paper's policy is a memoryless MLP over `o_prop ⊕ z_t` (Eq. 1) and rsl-rl's new (>= 4.0.0) construction path already splits actor/critic, so no custom architecture is needed. Class attributes `paper_terrain_token_dim = 4` and `is_recurrent = False` document the contract. [`agents/rsl_rl_ppo_cfg.py::BasePPORunnerCfg`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/agents/rsl_rl_ppo_cfg.py) was modernized to the new `RslRlMLPModelCfg` actor/critic API: both reference the qualified name `"unitree_dsc_lab.tasks.stair_climb.policy.actor_critic:StairClimbActorCritic"` (resolved by `rsl_rl.utils.resolve_callable`), `obs_groups = {"actor": ["policy"], "critic": ["critic"]}` matches the env, paper-aligned hidden dims `[512, 256, 128]` + `elu` carry over. Smoke-tested against the live `rsl_rl` install: stochastic actor forward shape `(B, num_actions)`, log-prob, entropy/std, `update_normalization` no-op; deterministic critic returns reproducible `(B, 1)`; `EmpiricalNormalization` activates when `obs_normalization=True`; qualified-name string parses to the expected class.
+- [x] **§12 — `ThreeStagePPORunner` implemented.** [`tasks/stair_climb/policy/ppo_runner.py::ThreeStagePPORunner`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/policy/ppo_runner.py) inherits `OnPolicyRunner` and adds the encoder + its Adam optimiser. Three entry points: `learn_stage1(num_iterations)` delegates to `super().learn()` unchanged; `learn_stage2(num_epochs, batch_size, sl_epochs_per_rollout)` freezes actor + critic, rolls out, collects `(BEV, z_t_gt)` via `env.get_bev()` + `env.privileged_teacher.token()`, then runs mini-batch SL with `terrain_loss` — raises `RuntimeError` immediately if `get_bev()` absent; `learn_stage3(num_iterations, lr_scale=0.3)` scales both PPO and encoder LRs by `lr_scale`, runs the standard PPO loop, and appends a perception side-loss pass after each `alg.update()` (separate encoder optimiser, no interference with PPO). `save()`/`load()` extend the parent to include `encoder_state_dict` + `encoder_optimizer_state_dict` in the checkpoint. Three stage scripts in [`scripts/stages/`](scripts/stages/) bootstrap AppLauncher, create the env + wrapper, instantiate the runner, and call the appropriate `learn_stage*()` method. Smoke-tested: construction, `learn_stage1` delegation, stage-2 `RuntimeError` on missing `get_bev`, SL loop runs (loss finite: total≈0.71, cls≈1.13, h≈0.004, d≈0.03), encoder round-trip checkpoint save/load, stage-3 graceful no-BEV fallback. All 7 tests pass; all 4 files `py_compile` cleanly.
 
 ### To-Do — environment
 
@@ -65,7 +66,7 @@ A living view of where this replication stands. Tick items off as you finish the
 ### To-Do — simulation & training code
 
 - [x] **§11** — `G1StairClimbEnvCfg` scaffolded (scene with `StairTerrainGeneratorCfg`, proprio + `terrain_token_privileged` obs, joint-pos actions, forward-velocity command, IsaacLab-default rough-locomotion reward stack + stair-specific shaping (`swing_clearance_bonus`/`step_alignment_bonus`), reset/startup/interval events incl. `reset_privileged_teacher`, terminations, `terrain_levels_vel` curriculum).
-- [ ] **§12** — Implement `ThreeStagePPORunner` (stage-1 PPO loop, stage-2 perception SL, stage-3 joint loss).
+- [x] **§12** — Implement `ThreeStagePPORunner` (stage-1 PPO loop, stage-2 perception SL, stage-3 joint loss).
 - [ ] **§12** — Stage 1 reaches `success_rate > 0.85` on training stair heights.
 - [ ] **§12** — Stage 2 hits `MAE(h) < 1 cm`, `MAE(d) < 1 cm`, `class_acc > 99 %`.
 - [ ] **§12** — Stage 3 joint fine-tune converges with LR × 0.3.
@@ -515,7 +516,21 @@ PPO hyperparameters follow paper §III-D + Table II (lr 3e-4, γ 0.99, λ 0.95, 
 
 ## 12. Three-Stage Training Pipeline
 
-The three-stage trainer is implemented in [`tasks/stair_climb/policy/ppo_runner.py::ThreeStagePPORunner`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/policy/ppo_runner.py); each `scripts/stages/...` entry below delegates to it.
+**Status: `ThreeStagePPORunner` implemented** — [`tasks/stair_climb/policy/ppo_runner.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/policy/ppo_runner.py).
+
+`ThreeStagePPORunner(OnPolicyRunner)` holds a `BEVStudentEncoder` and its Adam optimiser alongside the standard PPO models. Three entry points:
+
+| Method | Delegates to | What it does |
+|---|---|---|
+| `learn_stage1(num_iterations)` | `super().learn()` | Pure PPO, teacher z_t, unchanged rsl-rl loop |
+| `learn_stage2(num_epochs, batch_size, sl_epochs_per_rollout)` | Custom SL loop | Freeze policy; collect `(BEV, z_t_gt)` via `env.get_bev()` + teacher; mini-batch `terrain_loss` |
+| `learn_stage3(num_iterations, lr_scale=0.3)` | Custom loop | Scale LRs ×0.3; rollout + PPO update; separate encoder SL pass after each `alg.update()` |
+
+`save()`/`load()` extend the parent checkpoint with `encoder_state_dict` + `encoder_optimizer_state_dict`.
+
+> **Stage 2 prerequisite:** the env must expose `get_bev() -> Tensor(num_envs, 6, 60, 60)`. Add a simulated depth sensor to the env and implement `get_bev()` (the real-world counterpart is `deploy/pointcloud_to_bev.py`). A `RuntimeError` is raised at startup if the method is absent.
+
+> **Stage 3 note:** rollouts still use teacher z_t for the policy observation (stable actor while encoder catches up). Full end-to-end student z_t → policy → gradient → encoder is a future extension.
 
 The Gym task id registered by `unitree_dsc_lab` is **`Unitree-G1-23dof-StairClimb-v0`** (see [`tasks/stair_climb/robots/g1_23dof/__init__.py`](source/unitree_dsc_lab/unitree_dsc_lab/tasks/stair_climb/robots/g1_23dof/__init__.py)).
 
@@ -525,8 +540,6 @@ python scripts/stages/train_stage1_policy.py \
     --task Unitree-G1-23dof-StairClimb-v0 --num_envs 4096 \
     --max_iterations 6000 --headless \
     --logdir logs/stage1
-# or equivalently:
-./unitree_dsc_lab.sh -t --task Unitree-G1-23dof-StairClimb-v0
 ```
 Targets: `success_rate > 0.85` on training stair heights.
 
@@ -536,8 +549,8 @@ Freeze the policy, run rollouts, store `(BEV, z_t_gt)` pairs, train CNN until:
 
 ```bash
 python scripts/stages/train_stage2_perception.py \
-    --policy_ckpt logs/stage1/best.pt \
-    --epochs 50 --batch_size 256 \
+    --policy_ckpt logs/stage1/Unitree-G1-23dof-StairClimb-v0/model_6000.pt \
+    --num_envs 1024 --epochs 50 --batch_size 256 \
     --logdir logs/stage2
 ```
 
@@ -545,8 +558,8 @@ python scripts/stages/train_stage2_perception.py \
 Unfreeze both. Loss = `L_PPO + 1.0 * L_terrain`. Reduce learning rate by ×0.3.
 ```bash
 python scripts/stages/train_stage3_joint.py \
-    --resume_policy logs/stage1/best.pt \
-    --resume_encoder logs/stage2/best.pt \
+    --resume_policy logs/stage1/Unitree-G1-23dof-StairClimb-v0/model_6000.pt \
+    --resume_encoder logs/stage2/Unitree-G1-23dof-StairClimb-v0/encoder_best.pt \
     --max_iterations 3000 --num_envs 2048 \
     --logdir logs/stage3
 ```
@@ -686,4 +699,4 @@ ros2 topic pub /cmd_vel geometry_msgs/Twist "{linear: {x: 0.3}}"
 
 ---
 
-*Last updated: 2026-05-17 — §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded); §9 `points_to_bev` + `BEVStudentEncoder` + `terrain_loss` implemented (≈ 2.2 M params, `predict_token` matches teacher layout, yaw head isolated from `terrain_loss`, smoke-tested end-to-end with real BEVs); §11 stair-shaping rewards `swing_clearance_bonus` + `step_alignment_bonus` implemented as `ManagerTermBase` classes (per-foot state, class-id gated) and wired into `RewardsCfg`; §11 `StairClimbActorCritic` implemented as a thin `rsl_rl.models.MLPModel` subclass and referenced via qualified-name from a modernized `BasePPORunnerCfg` (new actor/critic API, paper-aligned hidden dims + PPO hyperparams), smoke-tested against the live `rsl_rl` install for both actor (Gaussian) and critic (deterministic) roles. Remaining gaps: `foot_contact_flags` obs, three-stage runner (`ThreeStagePPORunner`). Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
+*Last updated: 2026-05-17 — §12 `ThreeStagePPORunner` implemented (`learn_stage1/2/3`, encoder SL loop, save/load checkpoint extension); three stage scripts in `scripts/stages/` each bootstrap AppLauncher + create env + call the appropriate stage method; smoke-tested 7/7. See §0 Done list for the complete history. Previous: §8 follow-up wired (`StairTerrainGenerator` + `(row, col)` GT registry, `PrivilegedTeacher.refresh_from_terrain()`, `mdp.reset_privileged_teacher` event term, `G1StairClimbEnvCfg` scaffolded); §9 `points_to_bev` + `BEVStudentEncoder` + `terrain_loss` implemented (≈ 2.2 M params, `predict_token` matches teacher layout, yaw head isolated from `terrain_loss`, smoke-tested end-to-end with real BEVs); §11 stair-shaping rewards `swing_clearance_bonus` + `step_alignment_bonus` implemented as `ManagerTermBase` classes (per-foot state, class-id gated) and wired into `RewardsCfg`; §11 `StairClimbActorCritic` implemented as a thin `rsl_rl.models.MLPModel` subclass and referenced via qualified-name from a modernized `BasePPORunnerCfg` (new actor/critic API, paper-aligned hidden dims + PPO hyperparams), smoke-tested against the live `rsl_rl` install for both actor (Gaussian) and critic (deterministic) roles. Remaining gaps: `foot_contact_flags` obs, three-stage runner (`ThreeStagePPORunner`). Tested with Isaac Lab v2.3.2, Isaac Sim 5.1.0, Python 3.11, PyTorch 2.6.0+cu124, Unitree G1 firmware 1.4.*
